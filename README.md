@@ -25,7 +25,9 @@ pip install -r requirements.txt
 
 ## Dataset
 
-The dataset images are expected to be located in a directory relative to the `train.csv` and `test.csv` paths. The CSV files should have columns for `image` (relative path) and `plant_disease` (string label).
+**Download the image dataset here:** [Google Drive Link](https://drive.google.com/drive/folders/1jQpenttWrgLmnycHAdRnor3ffMQObWdL?usp=sharing)
+
+After downloading, place the `train` and `test` folders in the same directory as the `train.csv` and `test.csv` files. The CSV files contain the relative paths (`image` column) and the corresponding labels (`plant_disease` column).
 
 ## Training & Evaluation
 
