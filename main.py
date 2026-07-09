@@ -74,8 +74,11 @@ train_tf = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.RandomHorizontalFlip(),
     transforms.RandomRotation(20),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+    transforms.RandomApply([transforms.GaussianBlur(3)], p=0.3),
     transforms.ToTensor(),
-    transforms.Normalize([0.5]*3, [0.5]*3)
+    transforms.Normalize([0.5]*3, [0.5]*3),
+    transforms.RandomErasing(p=0.2, scale=(0.02, 0.2), ratio=(0.3, 3.3), value=0)
 ])
 
 val_tf = transforms.Compose([
@@ -158,9 +161,10 @@ class Model(nn.Module):
 
 model = Model().to(DEVICE)
 
-criterion = nn.CrossEntropyLoss()
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 optimizer = optim.AdamW(model.parameters(), lr=1e-4)
 scaler = torch.amp.GradScaler("cuda")
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
 def make_perm(dataset_size, seed):
     g = torch.Generator()
@@ -275,7 +279,9 @@ for epoch in range(start_epoch, EPOCHS):
 
     val_acc = evaluate(model, val_loader)
 
-    print(f"Epoch {epoch} | val_acc={val_acc:.4f}")
+    scheduler.step()
+
+    print(f"Epoch {epoch} | val_acc={val_acc:.4f} | lr={scheduler.get_last_lr()[0]:.2e}")
 
     if val_acc > best_score:
         best_score = val_acc
