@@ -1,7 +1,3 @@
-
-
-
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -18,6 +14,8 @@ from albumentations.pytorch import ToTensorV2
 from tqdm import tqdm
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
+from timm.data import Mixup
+import torch.nn.functional as F
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -132,6 +130,27 @@ class CNNBackbone(nn.Module):
         return self.model(x)[-1]
 
 
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=0.25):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def forward(self, inputs, targets):
+        if targets.dim() == 1:
+            targets = F.one_hot(targets, num_classes=inputs.size(-1)).float()
+        
+        probs = F.softmax(inputs, dim=-1)
+        pt = torch.sum(probs * targets, dim=-1)
+        log_probs = F.log_softmax(inputs, dim=-1)
+        
+        loss = -torch.sum(targets * log_probs, dim=-1)
+        focal_weight = (1 - pt) ** self.gamma
+        loss = self.alpha * focal_weight * loss
+        
+        return loss.mean()
+
+
 from torchvision.models.swin_transformer import SwinTransformerBlock
 
 class SwinBlockWrapper(nn.Module):
@@ -226,10 +245,15 @@ class Model(nn.Module):
 
 model = Model().to(DEVICE)
 
-criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+criterion = FocalLoss(gamma=2.0, alpha=0.25)
 optimizer = optim.AdamW(model.parameters(), lr=1e-4)
 scaler = torch.amp.GradScaler("cuda")
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+mixup_fn = Mixup(
+    mixup_alpha=0.8, cutmix_alpha=1.0, prob=1.0, switch_prob=0.5,
+    mode='batch', label_smoothing=0.1, num_classes=num_classes
+)
 
 def make_perm(dataset_size, seed):
     g = torch.Generator()
@@ -321,6 +345,8 @@ for epoch in range(start_epoch, EPOCHS):
 
         imgs = imgs.to(DEVICE)
         y = y.to(DEVICE)
+        
+        imgs, y = mixup_fn(imgs, y)
 
         optimizer.zero_grad()
 
