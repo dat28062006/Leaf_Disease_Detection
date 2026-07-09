@@ -16,12 +16,17 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from timm.data import Mixup
 import torch.nn.functional as F
+import argparse
+
+parser = argparse.ArgumentParser(description="Leaf Disease Detection")
+parser.add_argument("--mode", default="train", choices=["train", "test"], help="Run mode: train or test")
+args = parser.parse_args()
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 IMG_SIZE = 224
 BATCH_SIZE = 32
-EPOCHS = 10
+EPOCHS = 30
 
 BASE_PATH = "."
 
@@ -157,14 +162,15 @@ class SwinBlockWrapper(nn.Module):
     def __init__(self, dim, num_heads=8, window_size=[7, 7]):
         super().__init__()
         self.proj = nn.Linear(dim, dim)
-        
+        shift = [window_size[0] // 2, window_size[1] // 2]
+
         self.block1 = SwinTransformerBlock(
-            dim=dim, num_heads=num_heads, window_size=window_size, 
+            dim=dim, num_heads=num_heads, window_size=window_size,
             shift_size=[0, 0], mlp_ratio=4.0, dropout=0.1, attention_dropout=0.1, norm_layer=nn.LayerNorm
         )
         self.block2 = SwinTransformerBlock(
-            dim=dim, num_heads=num_heads, window_size=window_size, 
-            shift_size=[0, 0], mlp_ratio=4.0, dropout=0.1, attention_dropout=0.1, norm_layer=nn.LayerNorm
+            dim=dim, num_heads=num_heads, window_size=window_size,
+            shift_size=shift, mlp_ratio=4.0, dropout=0.1, attention_dropout=0.1, norm_layer=nn.LayerNorm
         )
 
     def forward(self, x):
@@ -274,7 +280,6 @@ def save_ckpt(epoch, global_step, best_score, perm):
 start_epoch = 0
 global_step = 0
 best_score = 0
-train_dataset = CSVDataset(train_df, train_tf)
 
 if os.path.exists(CKPT_PATH):
     ckpt = torch.load(CKPT_PATH, map_location=DEVICE)
@@ -331,11 +336,8 @@ def evaluate(model, val_loader):
     return correct / total
 
 
-steps_per_epoch = len(train_loader)
-
-start_epoch = global_step // steps_per_epoch
-
-for epoch in range(start_epoch, EPOCHS):
+if args.mode == "train":
+  for epoch in range(start_epoch, EPOCHS):
 
     model.train()
 
@@ -345,7 +347,7 @@ for epoch in range(start_epoch, EPOCHS):
 
         imgs = imgs.to(DEVICE)
         y = y.to(DEVICE)
-        
+
         imgs, y = mixup_fn(imgs, y)
 
         optimizer.zero_grad()
@@ -355,6 +357,8 @@ for epoch in range(start_epoch, EPOCHS):
             loss = criterion(out, y)
 
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
 
@@ -411,51 +415,45 @@ class TestDataset(Dataset):
 
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
-test_df = pd.read_csv(TEST_CSV)
+if args.mode == "test":
+    test_df = pd.read_csv(TEST_CSV)
 
-test_loader = DataLoader(
-    TestDataset(test_df, val_tf),
-    batch_size=32,
-    shuffle=False,
-    num_workers=4,
-    pin_memory=True,
-    persistent_workers=True
-)
+    test_loader = DataLoader(
+        TestDataset(test_df, val_tf),
+        batch_size=32,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True
+    )
 
-model = Model().to(DEVICE)
+    best_ckpt = torch.load("best.pth", map_location=DEVICE)
+    model.load_state_dict(best_ckpt["model"])
+    model.eval()
 
-ckpt = torch.load(CKPT_PATH, map_location=DEVICE)
+    y_true = []
+    y_pred = []
 
-model.load_state_dict(ckpt["model"])
+    with torch.no_grad():
+        for imgs, labels in tqdm(test_loader):
+            imgs = imgs.to(DEVICE)
+            labels = labels.to(DEVICE)
 
-model.eval()
+            outputs = model(imgs)
+            preds = outputs.argmax(dim=1)
 
-y_true = []
-y_pred = []
+            y_true.extend(labels.cpu().numpy())
+            y_pred.extend(preds.cpu().numpy())
 
-with torch.no_grad():
-    for imgs, labels in tqdm(test_loader):
-        imgs = imgs.to(DEVICE)
-        labels = labels.to(DEVICE)
+    print("Accuracy :", accuracy_score(y_true, y_pred))
+    print("Precision:", precision_score(y_true, y_pred, average="weighted"))
+    print("Recall   :", recall_score(y_true, y_pred, average="weighted"))
+    print("F1-score :", f1_score(y_true, y_pred, average="weighted"))
 
-        outputs = model(imgs)
-        preds = outputs.argmax(dim=1)
+    missing = set(test_df["plant_disease"]) - set(le.classes_)
+    print("Missing classes:", missing)
 
-        y_true.extend(labels.cpu().numpy())
-        y_pred.extend(preds.cpu().numpy())
-
-print("Accuracy :", accuracy_score(y_true, y_pred))
-print("Precision:", precision_score(y_true, y_pred, average="weighted"))
-print("Recall   :", recall_score(y_true, y_pred, average="weighted"))
-print("F1-score :", f1_score(y_true, y_pred, average="weighted"))
-
-missing = set(test_df["plant_disease"]) - set(le.classes_)
-print(missing)
-
-import torch
-
-ckpt = torch.load(CKPT_PATH, map_location="cpu")
-
-print("Epoch      :", ckpt["epoch"])
-print("Global step:", ckpt["step"])
-print("Best score :", ckpt["best_score"])
+    ckpt = torch.load(CKPT_PATH, map_location="cpu")
+    print("Epoch      :", ckpt["epoch"])
+    print("Global step:", ckpt["step"])
+    print("Best score :", ckpt["best_score"])
