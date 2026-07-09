@@ -77,14 +77,14 @@ train_tf = transforms.Compose([
     transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
     transforms.RandomApply([transforms.GaussianBlur(3)], p=0.3),
     transforms.ToTensor(),
-    transforms.Normalize([0.5]*3, [0.5]*3),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     transforms.RandomErasing(p=0.2, scale=(0.02, 0.2), ratio=(0.3, 3.3), value=0)
 ])
 
 val_tf = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
-    transforms.Normalize([0.5]*3, [0.5]*3)
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
 train_dataset = CSVDataset(train_df, train_tf)
@@ -122,25 +122,32 @@ class CNNBackbone(nn.Module):
         return self.model(x)[-1]
 
 
-class ViTBlock(nn.Module):
-    def __init__(self, dim):
+from torchvision.models.swin_transformer import SwinTransformerBlock
+
+class SwinBlockWrapper(nn.Module):
+    def __init__(self, dim, num_heads=8, window_size=[7, 7]):
         super().__init__()
         self.proj = nn.Linear(dim, dim)
-
-        enc = nn.TransformerEncoderLayer(
-            d_model=dim,
-            nhead=8,
-            batch_first=True
+        
+        self.block1 = SwinTransformerBlock(
+            dim=dim, num_heads=num_heads, window_size=window_size, 
+            shift_size=[0, 0], mlp_ratio=4.0, dropout=0.1, attention_dropout=0.1, norm_layer=nn.LayerNorm
         )
-
-        self.encoder = nn.TransformerEncoder(enc, num_layers=2)
+        self.block2 = SwinTransformerBlock(
+            dim=dim, num_heads=num_heads, window_size=window_size, 
+            shift_size=[0, 0], mlp_ratio=4.0, dropout=0.1, attention_dropout=0.1, norm_layer=nn.LayerNorm
+        )
 
     def forward(self, x):
         B, C, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2)
+        x = x.permute(0, 2, 3, 1) # (B, H, W, C)
         x = self.proj(x)
-        x = self.encoder(x)
-        return x.mean(dim=1)
+        
+        x = self.block1(x)
+        x = self.block2(x)
+        
+        x = x.mean(dim=[1, 2]) # (B, C)
+        return x
 
 
 class ChannelAttention(nn.Module):
@@ -193,16 +200,18 @@ class Model(nn.Module):
         self.cnn = CNNBackbone()
 
         with torch.no_grad():
-            c = self.cnn(torch.randn(1,3,224,224)).shape[1]
+            dummy_out = self.cnn(torch.randn(1, 3, IMG_SIZE, IMG_SIZE))
+            c = dummy_out.shape[1]
+            H, W = dummy_out.shape[2], dummy_out.shape[3]
 
         self.daam = DAAM(c)
-        self.vit = ViTBlock(c)
+        self.swin = SwinBlockWrapper(dim=c, window_size=[H, W])
         self.classifier = nn.Linear(c, num_classes)
 
     def forward(self, x):
         x = self.cnn(x)
         x = self.daam(x)
-        x = self.vit(x)
+        x = self.swin(x)
         return self.classifier(x)
 
 model = Model().to(DEVICE)
