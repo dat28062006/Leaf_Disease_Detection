@@ -5,3 +5,5 @@ scikit-learn
 tqdm
 pandas
 pillow
+albumentations
+opencv-python-headless

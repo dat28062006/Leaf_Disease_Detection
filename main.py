@@ -11,6 +11,10 @@ import timm
 import os
 import pandas as pd
 from PIL import Image
+import numpy as np
+import cv2
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 from tqdm import tqdm
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
@@ -60,31 +64,37 @@ class CSVDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-
         img_path = os.path.join(BASE_PATH, row["image"])
 
-        img = Image.open(img_path).convert("RGB")
+        img = cv2.imread(img_path)
+        if img is not None:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        else:
+            img = np.array(Image.open(img_path).convert("RGB"))
 
         if self.transform:
-            img = self.transform(img)
+            img = self.transform(image=img)["image"]
 
         return img, row["label"]
 
-train_tf = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(20),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-    transforms.RandomApply([transforms.GaussianBlur(3)], p=0.3),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    transforms.RandomErasing(p=0.2, scale=(0.02, 0.2), ratio=(0.3, 3.3), value=0)
+train_tf = A.Compose([
+    A.RandomResizedCrop(IMG_SIZE, IMG_SIZE, scale=(0.8, 1.0)),
+    A.HorizontalFlip(p=0.5),
+    A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=20, p=0.5),
+    A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
+    A.GaussianBlur(blur_limit=(3, 7), p=0.3),
+    A.RandomRain(p=0.2, drop_length=20, drop_width=1, blur_value=3),
+    A.Spatter(p=0.2),
+    A.RandomShadow(p=0.2),
+    A.CoarseDropout(max_holes=8, max_height=32, max_width=32, min_holes=1, min_height=8, min_width=8, fill_value=0, p=0.2),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2()
 ])
 
-val_tf = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+val_tf = A.Compose([
+    A.Resize(IMG_SIZE, IMG_SIZE),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2()
 ])
 
 train_dataset = CSVDataset(train_df, train_tf)
@@ -358,13 +368,17 @@ class TestDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
+        img_path = os.path.join(BASE_PATH, row["image"])
 
-        img = Image.open(os.path.join(BASE_PATH, row["image"])).convert("RGB")
+        img = cv2.imread(img_path)
+        if img is not None:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        else:
+            img = np.array(Image.open(img_path).convert("RGB"))
 
         if self.transform:
-            img = self.transform(img)
+            img = self.transform(image=img)["image"]
 
-        # Label lấy trực tiếp từ CSV
         label = le.transform([row["plant_disease"]])[0]
 
         return img, label
