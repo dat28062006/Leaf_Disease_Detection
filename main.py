@@ -1,0 +1,360 @@
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+import timm
+import os
+import pandas as pd
+from PIL import Image
+from tqdm import tqdm
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+IMG_SIZE = 224
+BATCH_SIZE = 32
+EPOCHS = 10
+
+BASE_PATH = "."
+
+TRAIN_CSV = f"{BASE_PATH}/train.csv"
+TEST_CSV = f"{BASE_PATH}/test.csv"
+SAVE_DIR = f"{BASE_PATH}/checkpoints"
+os.makedirs(SAVE_DIR, exist_ok=True)
+CKPT_PATH = f"{SAVE_DIR}/last.pth"
+
+print("Device:", DEVICE)
+
+df = pd.read_csv(TRAIN_CSV)
+
+
+df["image"] = df["image"].str.replace("\\", "/", regex=False)
+
+le = LabelEncoder()
+df["label"] = le.fit_transform(df["plant_disease"])
+
+num_classes = len(le.classes_)
+
+train_df, val_df = train_test_split(
+    df,
+    test_size=0.1,
+    random_state=42,
+    stratify=df["label"]
+)
+
+print(len(train_df), len(val_df))
+
+class CSVDataset(Dataset):
+    def __init__(self, df, transform=None):
+        self.df = df.reset_index(drop=True)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        img_path = os.path.join(BASE_PATH, row["image"])
+
+        img = Image.open(img_path).convert("RGB")
+
+        if self.transform:
+            img = self.transform(img)
+
+        return img, row["label"]
+
+train_tf = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(20),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3)
+])
+
+val_tf = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3)
+])
+
+train_dataset = CSVDataset(train_df, train_tf)
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=4,
+    pin_memory=True,
+      persistent_workers=True,
+    prefetch_factor=4,
+
+    drop_last=True
+)
+
+val_loader = DataLoader(
+    CSVDataset(val_df, val_tf),
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True
+)
+
+class CNNBackbone(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = timm.create_model(
+            "efficientnet_b4",
+            pretrained=True,
+            features_only=True
+        )
+
+    def forward(self, x):
+        return self.model(x)[-1]
+
+
+class ViTBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.proj = nn.Linear(dim, dim)
+
+        enc = nn.TransformerEncoderLayer(
+            d_model=dim,
+            nhead=8,
+            batch_first=True
+        )
+
+        self.encoder = nn.TransformerEncoder(enc, num_layers=2)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)
+        x = self.proj(x)
+        x = self.encoder(x)
+        return x.mean(dim=1)
+
+
+class Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.cnn = CNNBackbone()
+
+        with torch.no_grad():
+            c = self.cnn(torch.randn(1,3,224,224)).shape[1]
+
+        self.vit = ViTBlock(c)
+        self.classifier = nn.Linear(c, num_classes)
+
+    def forward(self, x):
+        x = self.cnn(x)
+        x = self.vit(x)
+        return self.classifier(x)
+
+model = Model().to(DEVICE)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+scaler = torch.amp.GradScaler("cuda")
+
+def make_perm(dataset_size, seed):
+    g = torch.Generator()
+    g.manual_seed(seed)
+    return torch.randperm(dataset_size, generator=g).tolist()
+
+def save_ckpt(epoch, global_step, best_score, perm):
+    torch.save({
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scaler": scaler.state_dict(),
+        "epoch": epoch,
+        "step": global_step,
+        "best_score": best_score,
+        "perm": perm   # 🔥 QUAN TRỌNG
+    }, CKPT_PATH)
+
+start_epoch = 0
+global_step = 0
+best_score = 0
+train_dataset = CSVDataset(train_df, train_tf)
+
+if os.path.exists(CKPT_PATH):
+    ckpt = torch.load(CKPT_PATH, map_location=DEVICE)
+
+    model.load_state_dict(ckpt["model"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    scaler.load_state_dict(ckpt["scaler"])
+
+    start_epoch = ckpt["epoch"]
+    global_step = ckpt["step"]
+    best_score = ckpt["best_score"]
+    perm = ckpt["perm"]
+
+    print("Resumed OK")
+else:
+    perm = make_perm(len(train_dataset), seed=42)
+
+from sklearn.metrics import precision_score, recall_score, f1_score
+import numpy as np
+
+import torch
+from tqdm import tqdm
+
+def evaluate(model, val_loader):
+    model.eval()
+
+    correct = 0
+    total = 0
+
+    pbar = tqdm(val_loader, desc="Validating", leave=False)
+
+    with torch.no_grad():
+        for imgs, labels in pbar:
+
+            imgs = imgs.to(DEVICE)
+            labels = labels.to(DEVICE)
+
+            with torch.amp.autocast("cuda"):
+                outputs = model(imgs)
+
+            preds = outputs.argmax(dim=1)
+
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+            acc = correct / total
+
+            pbar.set_postfix({
+                "acc": f"{acc:.4f}",
+                "correct": correct,
+                "total": total
+            })
+
+    return correct / total
+
+
+steps_per_epoch = len(train_loader)
+
+start_epoch = global_step // steps_per_epoch
+
+for epoch in range(start_epoch, EPOCHS):
+
+    model.train()
+
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+
+    for batch_idx, (imgs, y) in enumerate(pbar):
+
+        imgs = imgs.to(DEVICE)
+        y = y.to(DEVICE)
+
+        optimizer.zero_grad()
+
+        with torch.amp.autocast("cuda"):
+            out = model(imgs)
+            loss = criterion(out, y)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        global_step += 1
+
+        pbar.set_postfix({
+            "step": global_step,
+            "loss": float(loss)
+        })
+
+        if global_step % 50 == 0:
+            save_ckpt(epoch, global_step, best_score, perm)
+
+    val_acc = evaluate(model, val_loader)
+
+    print(f"Epoch {epoch} | val_acc={val_acc:.4f}")
+
+    if val_acc > best_score:
+        best_score = val_acc
+        torch.save({
+            "model": model.state_dict(),
+            "epoch": epoch,
+            "val_acc": val_acc
+        }, "best.pth")
+
+    save_ckpt(epoch, global_step, best_score, perm)
+
+class TestDataset(Dataset):
+    def __init__(self, df, transform=None):
+        self.df = df.reset_index(drop=True)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        img = Image.open(os.path.join(BASE_PATH, row["image"])).convert("RGB")
+
+        if self.transform:
+            img = self.transform(img)
+
+        # Label lấy trực tiếp từ CSV
+        label = le.transform([row["plant_disease"]])[0]
+
+        return img, label
+
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+test_df = pd.read_csv(TEST_CSV)
+
+test_loader = DataLoader(
+    TestDataset(test_df, val_tf),
+    batch_size=32,
+    shuffle=False,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True
+)
+
+model = Model().to(DEVICE)
+
+ckpt = torch.load(CKPT_PATH, map_location=DEVICE)
+
+model.load_state_dict(ckpt["model"])
+
+model.eval()
+
+y_true = []
+y_pred = []
+
+with torch.no_grad():
+    for imgs, labels in tqdm(test_loader):
+        imgs = imgs.to(DEVICE)
+        labels = labels.to(DEVICE)
+
+        outputs = model(imgs)
+        preds = outputs.argmax(dim=1)
+
+        y_true.extend(labels.cpu().numpy())
+        y_pred.extend(preds.cpu().numpy())
+
+print("Accuracy :", accuracy_score(y_true, y_pred))
+print("Precision:", precision_score(y_true, y_pred, average="weighted"))
+print("Recall   :", recall_score(y_true, y_pred, average="weighted"))
+print("F1-score :", f1_score(y_true, y_pred, average="weighted"))
+
+missing = set(test_df["plant_disease"]) - set(le.classes_)
+print(missing)
+
+import torch
+
+ckpt = torch.load(CKPT_PATH, map_location="cpu")
+
+print("Epoch      :", ckpt["epoch"])
+print("Global step:", ckpt["step"])
+print("Best score :", ckpt["best_score"])
