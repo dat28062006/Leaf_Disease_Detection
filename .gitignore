@@ -1,0 +1,19 @@
+# Python bytecode and local agent metadata
+__pycache__/
+*.py[cod]
+.agents/
+
+# Local datasets, generated masks, and model artifacts
+PlantDoc_restored/
+SAM2_Masks/
+Train/
+test/
+*.pt
+*.pth
+*.ckpt
+
+# Training outputs
+new_model/checkpoints*/
+new_model/source_manifest_seed*.csv
+new_model/diagnostics_v5.jsonl
+new_model/latest_diagnostics_v5.json
